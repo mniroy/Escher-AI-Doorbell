@@ -139,20 +139,7 @@ bool ArduinoASRChat::connectWebSocket() {
   if (response.indexOf("101") >= 0 && response.indexOf("Switching Protocols") >= 0) {
     Serial.println("WebSocket connected");
     _wsConnected = true;
-
-    delay(100);
-    sendFullRequest();
-
-    // Wait for config confirmation
-    timeout = millis();
-    while (millis() - timeout < 2000) {
-      if (_client.available()) {
-        handleWebSocketData();
-        break;
-      }
-      delay(10);
-    }
-
+    _endMarkerSent = false;  // Reset flag on new connection
     return true;
   } else {
     Serial.println("WebSocket handshake failed");
@@ -175,6 +162,18 @@ bool ArduinoASRChat::isWebSocketConnected() {
 }
 
 bool ArduinoASRChat::startRecording() {
+  // If end marker was sent, need to reconnect WebSocket
+  if (_endMarkerSent) {
+    Serial.println("Reconnecting WebSocket for new session...");
+    disconnectWebSocket();
+    delay(100);
+    if (!connectWebSocket()) {
+      Serial.println("Failed to reconnect WebSocket!");
+      return false;
+    }
+    _endMarkerSent = false;
+  }
+
   if (!_wsConnected) {
     Serial.println("WebSocket not connected!");
     return false;
@@ -200,6 +199,10 @@ bool ArduinoASRChat::startRecording() {
   _sendBufferPos = 0;
   _sameResultCount = 0;
   _lastDotTime = millis();
+
+  // 发送新的会话请求，开始新的识别会话
+  sendFullRequest();
+  delay(50);  // 等待服务器确认
 
   return true;
 }
@@ -227,6 +230,7 @@ void ArduinoASRChat::stopRecording() {
   _hasNewResult = true;
 
   sendEndMarker();
+  _endMarkerSent = true;  // Mark that end marker has been sent
 
   // Trigger callback if set
   if (_resultCallback != nullptr && _recognizedText.length() > 0) {

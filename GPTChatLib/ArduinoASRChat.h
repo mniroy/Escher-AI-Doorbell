@@ -93,6 +93,7 @@ class ArduinoASRChat {
     bool _shouldStop = false;
     bool _hasSpeech = false;
     bool _hasNewResult = false;
+    bool _endMarkerSent = false;  // Track if end marker has been sent
 
     // Recording state
     String _lastResultText = "";
