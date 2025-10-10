@@ -64,8 +64,8 @@ The system uses a modular design with the following key components:
 
 ## 💻 Code Description
 
-### GPTChatLib Library
-Core library files that need to be copied to Arduino's libraries folder.
+### DAZI-AI Library
+A unified Arduino library that integrates all necessary components for AI voice assistant development.
 
 | Feature | Description |
 |---------|-------------|
@@ -75,20 +75,32 @@ Core library files that need to be copied to Arduino's libraries folder.
 | STT | Speech-to-Text functionality, converts user input to text |
 | Real-time ASR | ByteDance ASR integration with WebSocket protocol for streaming recognition |
 | VAD | Voice Activity Detection for automatic speech detection and silence handling |
-| Audio Processing | Processes and converts audio data formats |
+| Audio Processing | Processes and converts audio data formats (modified ESP32-audioI2S) |
+| Audio Playback | I2S audio output with support for multiple codecs (MP3, AAC, FLAC, Opus, Vorbis) |
 
 ### Code Structure
 ```
-├── examples/                     # Example projects
-│   ├── chat/                     # Push-to-talk voice chat example
-│   │   └── chat.ino              # Push-to-talk mode with INMP441
-│   └── chat_asr/                 # Continuous conversation example
-│       └── chat_asr.ino          # ASR-based continuous mode with memory
-└── GPTChatLib/                   # Core functionality library
-    ├── ArduinoGPTChat.cpp        # ChatGPT & TTS implementation
-    ├── ArduinoGPTChat.h          # ChatGPT & TTS header
-    ├── ArduinoASRChat.cpp        # Real-time ASR implementation
-    └── ArduinoASRChat.h          # Real-time ASR header
+DAZI-AI/
+├── library.properties            # Arduino library configuration
+├── keywords.txt                  # Syntax highlighting keywords
+├── README.md                     # Documentation
+├── src/                          # All source code
+│   ├── ArduinoGPTChat.cpp        # ChatGPT & TTS implementation
+│   ├── ArduinoGPTChat.h          # ChatGPT & TTS header
+│   ├── ArduinoASRChat.cpp        # Real-time ASR implementation
+│   ├── ArduinoASRChat.h          # Real-time ASR header
+│   ├── Audio.cpp                 # Modified ESP32-audioI2S library
+│   ├── Audio.h                   # Audio library header
+│   ├── aac_decoder/              # AAC audio decoder
+│   ├── flac_decoder/             # FLAC audio decoder
+│   ├── mp3_decoder/              # MP3 audio decoder
+│   ├── opus_decoder/             # Opus audio decoder
+│   └── vorbis_decoder/           # Vorbis audio decoder
+└── examples/                     # Example projects
+    ├── chat/                     # Push-to-talk voice chat example
+    │   └── chat.ino              # Push-to-talk mode with INMP441
+    └── chat_asr/                 # Continuous conversation example
+        └── chat_asr.ino          # ASR-based continuous mode with memory
 ```
 
 ## 🔌 Hardware Requirements
@@ -121,18 +133,38 @@ Core library files that need to be copied to Arduino's libraries folder.
 ## 🚀 Quick Start
 
 1. **Environment Setup**
-   - Install Arduino IDE
-   - Install ESP32 board support
+   - Install [Arduino IDE](https://www.arduino.cc/en/software) (version 2.0+ recommended)
+   - Install ESP32 board support in Arduino IDE:
+     - Go to `File` → `Preferences`
+     - Add ESP32 board manager URL: `https://espressif.github.io/arduino-esp32/package_esp32_index.json`
+     - Go to `Tools` → `Board` → `Boards Manager`
+     - Search for "ESP32" and install "esp32 by Espressif Systems"
 
-2. **Library Installation**
-   - Copy the following folders to Arduino's libraries directory:
-     - Copy `GPTChatLib` folder to `Arduino/libraries/`
-     - Copy `ESP32-audioI2S-master` folder to `Arduino/libraries/`
-   - Install additional required libraries through Arduino Library Manager:
-     - ArduinoWebsoket (v0.5.4)
-     - ArduinoJson (v7.4.1)
+2. **Library Installation via ZIP**
 
-3. **API Key Configuration**
+   **Method 1: Direct ZIP Installation (Recommended)**
+   - Download or create a ZIP file of the entire `DAZI-AI` folder
+   - Ensure the ZIP file structure has `library.properties` at the root level
+   - Open Arduino IDE
+   - Go to `Sketch` → `Include Library` → `Add .ZIP Library...`
+   - Select the `DAZI-AI.zip` file
+   - Wait for installation to complete
+
+   **Method 2: Manual Installation**
+   - Copy the entire `DAZI-AI` folder to your Arduino libraries directory:
+     - Windows: `Documents\Arduino\libraries\`
+     - macOS: `~/Documents/Arduino/libraries/`
+     - Linux: `~/Arduino/libraries/`
+   - Restart Arduino IDE
+
+3. **Install Required Dependencies**
+   - Open Arduino IDE Library Manager (`Tools` → `Manage Libraries...`)
+   - Search and install the following libraries:
+     - **ArduinoWebsocket** (v0.5.4 or later)
+     - **ArduinoJson** (v7.4.1 or later)
+     - **Seeed_ARDUINO_mbedtls** (v3.0.2 or later)
+
+4. **API Key Configuration**
 
    **For Push-to-Talk Mode** (`examples/chat/chat.ino`):
    - Replace `"your-api-key"` with your actual OpenAI API key
@@ -146,12 +178,18 @@ Core library files that need to be copied to Arduino's libraries folder.
    - Set `ENABLE_CONVERSATION_MEMORY` to 1 to enable memory or 0 to disable (line 7)
    - Optionally modify the system prompt to customize AI personality (lines 81-104)
 
-4. **Hardware Wiring**
+5. **Hardware Wiring**
    - Connect INMP441 microphone according to pin table above
    - Connect MAX98357A I2S audio amplifier for speaker output
 
+6. **Open Example Projects**
+   - After installing the library, examples will be available in Arduino IDE
+   - Go to `File` → `Examples` → `DAZI-AI`
+   - Choose either:
+     - **chat**: Push-to-talk mode example
+     - **chat_asr**: Continuous conversation mode example
 
-5. **Compile and Upload**
+7. **Compile and Upload**
    - Select the appropriate ESP32 development board
      - This project has been tested on ESP32S3 Dev Module and XIAO ESP32S3
      - Requirements: Flash Size >8M and PSRAM >4Mb
@@ -160,8 +198,9 @@ Core library files that need to be copied to Arduino's libraries folder.
      - PSRAM: Select "OPI PSRAM"
    - Compile and upload the code to your device
 
-6. **Testing**
-   - Open the serial monitor
+8. **Testing**
+   - Open the serial monitor (115200 baud)
+   - Wait for WiFi connection
    - Hold the BOOT button on your ESP32 to start recording
    - Speak your question or command while holding the button
    - Release the button to send the recording to ChatGPT
