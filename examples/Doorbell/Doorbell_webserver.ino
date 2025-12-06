@@ -1,0 +1,664 @@
+#include <WiFi.h>
+#include <WebServer.h>
+#include <Preferences.h>
+#include <ArduinoASRChat.h>
+#include <ArduinoGPTChat.h>
+#include <PubSubClient.h>
+#include "Audio.h"
+
+// ==========================================
+// CONFIGURATION & GLOBALS
+// ==========================================
+
+// Enable conversation memory
+#define ENABLE_CONVERSATION_MEMORY 1
+
+// Hardware Pin Definitions
+#define I2S_DOUT 47
+#define I2S_BCLK 48
+#define I2S_LRC 45
+
+#define I2S_MIC_SERIAL_CLOCK 5     // SCK
+#define I2S_MIC_LEFT_RIGHT_CLOCK 4 // WS
+#define I2S_MIC_SERIAL_DATA 6      // SD
+
+// RGB LED (NeoPixel)
+#define RGB_LED_PIN 48 
+
+#define BOOT_BUTTON_PIN 0
+#define SAMPLE_RATE 16000
+
+// Objects
+Preferences preferences;
+WebServer server(80);
+WiFiClient espClient;
+PubSubClient mqttClient(espClient);
+
+ArduinoASRChat *asrChat = NULL;
+ArduinoGPTChat *gptChat = NULL;
+Audio audio;
+
+// Settings Variables
+String wifi_ssid, wifi_pass;
+String asr_key, asr_clust;
+String openai_key, openai_url, sys_prompt;
+String ai_intro; // NEW: Customizable Intro
+
+// MQTT Variables
+String mqtt_server, mqtt_port, mqtt_user, mqtt_pass;
+String mqtt_topic_guest; 
+String mqtt_topic_ai;    
+String mqtt_topic_sub;   
+
+// Web Logging Buffer & Chat State
+String webLogBuffer = "";
+String lastUserText = "(Waiting for guest...)";
+String lastAIText = "(Waiting for AI...)";
+
+// Default System Prompt
+const char* default_prompt = 
+"Kamu adalah asisten doorbell pintar di Rumah Escher, rumah keluarga Indonesia. "
+"Perkenalkan diri: 'Halo, saya AI Rumah Escher, asisten rumah ini. Saya bantu jawab bel ya.' "
+"Fokusmu: ajak ngobrol orang yang menekan bel, cari tahu mereka siapa dan apa keperluannya. "
+"Selalu klasifikasikan pengunjung sebagai: kurir paket, kurir galon aqua, satpam, keluarga, atau tamu lain. "
+"Gunakan Bahasa Indonesia santai tapi sopan. Jawaban pendek: 1–2 kalimat, maksimal sekitar 25 kata.";
+
+// Default Intro
+const char* default_intro = "Halo, saya AI Rumah Escher.";
+
+// State Machine
+enum ConversationState { STATE_IDLE, STATE_LISTENING, STATE_PROCESSING_LLM, STATE_PLAYING_TTS, STATE_WAIT_TTS_COMPLETE };
+ConversationState currentState = STATE_IDLE;
+bool continuousMode = false;
+bool buttonPressed = false;
+bool wasButtonPressed = false;
+unsigned long ttsStartTime = 0;
+unsigned long ttsCheckTime = 0;
+bool isAPMode = false;
+unsigned long lastMqttReconnectAttempt = 0;
+
+// ==========================================
+// HELPERS
+// ==========================================
+
+void sysLog(String msg) {
+  // if (Serial) Serial.print(msg); // Disabled to prevent hanging on S3
+  webLogBuffer += msg; 
+  if (webLogBuffer.length() > 4000) {
+    webLogBuffer = webLogBuffer.substring(webLogBuffer.length() - 2000);
+  }
+}
+
+void sysLogLn(String msg) {
+  sysLog(msg + "\n");
+}
+
+String jsonEscape(String s) {
+  s.replace("\"", "\\\"");
+  s.replace("\n", " ");
+  s.replace("\r", "");
+  return s;
+}
+
+void setLedColor(uint8_t r, uint8_t g, uint8_t b) {
+  #ifdef RGB_BUILTIN
+    neopixelWrite(RGB_BUILTIN, r, g, b);
+  #else
+    neopixelWrite(RGB_LED_PIN, r, g, b);
+  #endif
+}
+
+// ==========================================
+// FORWARD DECLARATIONS
+// ==========================================
+void startContinuousMode(bool playIntro);
+void stopContinuousMode();
+void handleToggle();
+
+// ==========================================
+// MQTT FUNCTIONS
+// ==========================================
+
+void mqttCallback(char* topic, uint8_t* payload, unsigned int length) {
+  String message;
+  for (int i = 0; i < length; i++) {
+    message += (char)payload[i];
+  }
+  sysLogLn("[MQTT] Rx on " + String(topic) + ": " + message);
+
+  if (message.indexOf("trigger") >= 0 || message.indexOf("press") >= 0) {
+    sysLogLn("[MQTT] Trigger command received!");
+    if (!continuousMode) {
+      startContinuousMode(true); 
+    } else {
+      stopContinuousMode();
+    }
+  }
+}
+
+void setupMQTT() {
+  if (mqtt_server.length() > 0) {
+    int port = mqtt_port.toInt();
+    if (port == 0) port = 1883; 
+    mqttClient.setServer(mqtt_server.c_str(), port);
+    mqttClient.setCallback(mqttCallback);
+    sysLogLn("MQTT Configured: " + mqtt_server + ":" + String(port));
+  }
+}
+
+boolean reconnectMQTT() {
+  if (mqtt_server.length() == 0) return false;
+  if (mqttClient.connect("EscherDoorbell", mqtt_user.c_str(), mqtt_pass.c_str())) {
+    sysLogLn("[MQTT] Connected");
+    if (mqtt_topic_sub.length() > 0) {
+      mqttClient.subscribe(mqtt_topic_sub.c_str());
+      sysLogLn("[MQTT] Subscribed to: " + mqtt_topic_sub);
+    }
+  }
+  return mqttClient.connected();
+}
+
+void publishToTopic(String topic, String message) {
+  if (mqttClient.connected() && topic.length() > 0) {
+    mqttClient.publish(topic.c_str(), message.c_str());
+  }
+}
+
+// ==========================================
+// HTML PAGE TEMPLATE
+// ==========================================
+const char* html_template = R"rawliteral(
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Escher Doorbell AI</title>
+<style>
+  :root {
+    --bg-body: #f2f2f2; --bg-card: #ffffff; --text-main: #333333; --text-label: #555555;
+    --input-bg: #ffffff; --input-border: #ddd; --heading-color: #007bff; --divider-color: #eee;
+    --chat-guest-bg: #e3f2fd; --chat-guest-border: #bbdefb;
+    --chat-ai-bg: #e8f5e9; --chat-ai-border: #c8e6c9;
+  }
+  body.dark-mode {
+    --bg-body: #121212; --bg-card: #1e1e1e; --text-main: #e0e0e0; --text-label: #bbbbbb;
+    --input-bg: #2d2d2d; --input-border: #444; --heading-color: #4dabf7; --divider-color: #333;
+    --chat-guest-bg: #152b39; --chat-guest-border: #1e455e;
+    --chat-ai-bg: #16301b; --chat-ai-border: #234d2a;
+  }
+  body { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif; background: var(--bg-body); color: var(--text-main); padding: 20px; margin: 0; transition: background 0.3s, color 0.3s; }
+  .container { display: flex; flex-wrap: wrap; gap: 20px; max-width: 1000px; margin: 0 auto; }
+  .header-bar { width: 100%; display: flex; justify-content: space-between; align-items: center; margin-bottom: 20px; }
+  h1.main-title { margin: 0; color: var(--heading-color); font-size: 24px; }
+  .theme-toggle-btn { background: var(--bg-card); border: 1px solid var(--input-border); color: var(--text-main); padding: 8px 15px; border-radius: 20px; cursor: pointer; font-size: 14px; font-weight: bold; display: flex; align-items: center; gap: 5px; }
+  .card { background: var(--bg-card); flex: 1; min-width: 300px; padding: 20px; border-radius: 10px; box-shadow: 0 4px 6px rgba(0,0,0,0.1); display: flex; flex-direction: column; transition: background 0.3s; }
+  h2 { color: var(--heading-color); margin-top: 0; margin-bottom: 20px; border-bottom: 2px solid var(--divider-color); padding-bottom: 10px; }
+  label { font-weight: bold; display: block; margin-top: 15px; font-size: 13px; color: var(--text-label); }
+  input[type=text], input[type=password], textarea { width: 100%; padding: 10px; margin-top: 5px; border: 1px solid var(--input-border); background: var(--input-bg); color: var(--text-main); border-radius: 5px; box-sizing: border-box; font-size: 14px; }
+  input:focus, textarea:focus { border-color: var(--heading-color); outline: none; }
+  textarea.config { height: 150px; font-family: 'Courier New', monospace; font-size: 12px; line-height: 1.4; }
+  button.save-btn { width: 100%; background-color: var(--heading-color); color: white; padding: 12px; border: none; border-radius: 5px; cursor: pointer; margin-top: 20px; font-size: 16px; font-weight: bold; }
+  
+  .chat-window { padding: 15px; border-radius: 8px; margin-bottom: 10px; border: 1px solid transparent; }
+  .chat-guest { background-color: var(--chat-guest-bg); border-color: var(--chat-guest-border); }
+  .chat-ai { background-color: var(--chat-ai-bg); border-color: var(--chat-ai-border); }
+  .chat-label { font-size: 11px; font-weight: bold; text-transform: uppercase; margin-bottom: 5px; opacity: 0.7; }
+  .chat-text { font-size: 16px; line-height: 1.4; font-weight: 500; }
+  
+  #terminal { background-color: #1e1e1e; color: #00ff00; font-family: 'Courier New', monospace; padding: 15px; height: 300px; overflow-y: auto; border-radius: 5px; font-size: 13px; white-space: pre-wrap; line-height: 1.3; border: 1px solid var(--input-border); }
+  .clear-btn { background: #6c757d; color: white; border: none; padding: 8px 15px; border-radius: 4px; cursor: pointer; font-size: 12px; margin-top: 10px; }
+  .toggle-btn { background: #28a745; color: white; border: none; padding: 6px 15px; border-radius: 20px; cursor: pointer; font-size: 13px; font-weight: bold; }
+  .status-badge { display:inline-block; padding: 6px 12px; border-radius: 20px; background: #e9ecef; color: #495057; font-weight: bold; font-size: 12px; border: 1px solid #ced4da; }
+  .status-badge.live { background: #d4edda; color: #155724; border-color: #c3e6cb; }
+  .status-badge.live::before { content: "● "; color: #28a745; }
+</style>
+<script>
+  function toggleTheme() {
+    document.body.classList.toggle('dark-mode');
+    const isDark = document.body.classList.contains('dark-mode');
+    document.getElementById('theme-icon').innerText = isDark ? '☀️' : '🌙';
+    document.getElementById('theme-text').innerText = isDark ? 'Light Mode' : 'Dark Mode';
+  }
+
+  setInterval(function() {
+    fetch('/logs').then(r => r.text()).then(data => {
+      var term = document.getElementById("terminal");
+      if(term.innerHTML !== data) { term.innerHTML = data; term.scrollTop = term.scrollHeight; }
+    });
+    fetch('/conversation').then(r => r.json()).then(data => {
+      document.getElementById("txt-guest").innerText = data.user;
+      document.getElementById("txt-ai").innerText = data.ai;
+    });
+  }, 1000);
+</script>
+</head>
+<body>
+<div class="container">
+  <div class="header-bar">
+    <h1 class="main-title">Escher Doorbell Dashboard</h1>
+    <button class="theme-toggle-btn" onclick="toggleTheme()">
+      <span id="theme-icon">🌙</span> <span id="theme-text">Dark Mode</span>
+    </button>
+  </div>
+
+  <!-- CONFIG COLUMN -->
+  <div class="card">
+    <h2>Configuration</h2>
+    <form action="/save" method="POST">
+      <label>WiFi SSID</label><input type="text" name="ssid" id="ssid">
+      <label>WiFi Password</label><input type="password" name="pass" id="pass">
+      
+      <div style="margin: 20px 0; border-top: 1px solid var(--divider-color);"></div>
+      <h3>AI Settings</h3>
+      <label>ASR Key</label><input type="text" name="asrkey" id="asrkey">
+      <label>ASR Cluster</label><input type="text" name="asrclus" id="asrclus">
+      <label>OpenAI Key</label><input type="password" name="apikey" id="apikey">
+      <label>Base URL</label><input type="text" name="apiurl" id="apiurl">
+      
+      <!-- INTRO SETTING (NEW) -->
+      <label>Intro Text (Played on first press)</label><textarea class="config" name="intro" id="intro" style="height:60px;"></textarea>
+      
+      <label>System Prompt</label><textarea class="config" name="prompt" id="prompt"></textarea>
+
+      <div style="margin: 20px 0; border-top: 1px solid var(--divider-color);"></div>
+      <h3>MQTT Settings</h3>
+      <label>Broker IP/URL</label><input type="text" name="mqserver" id="mqserver">
+      <label>Port (Default 1883)</label><input type="text" name="mqport" id="mqport">
+      <label>Username (Optional)</label><input type="text" name="mquser" id="mquser">
+      <label>Password (Optional)</label><input type="password" name="mqpass" id="mqpass">
+      <label>Guest Text Topic</label><input type="text" name="mqpub_guest" id="mqpub_guest" placeholder="escher/doorbell/guest">
+      <label>AI Response Topic</label><input type="text" name="mqpub_ai" id="mqpub_ai" placeholder="escher/doorbell/ai">
+      <label>Subscribe Topic</label><input type="text" name="mqsub" id="mqsub" placeholder="escher/doorbell/in">
+      
+      <button class="save-btn" type="submit">Save & Restart Device</button>
+    </form>
+  </div>
+
+  <!-- INTERACTION COLUMN -->
+  <div class="card">
+    <h2>Live Interaction</h2>
+    <div style="display:flex; justify-content:space-between; align-items:center; margin-bottom:15px;">
+      <div class="status-badge live">System Active</div>
+      <button class="toggle-btn" onclick="fetch('/toggle')">🎤 Toggle Talk</button>
+    </div>
+
+    <div class="chat-window chat-guest">
+      <div class="chat-label">Guest Says</div>
+      <div class="chat-text" id="txt-guest">...</div>
+    </div>
+
+    <div class="chat-window chat-ai">
+      <div class="chat-label">AI Response</div>
+      <div class="chat-text" id="txt-ai">...</div>
+    </div>
+
+    <hr style="margin: 20px 0; border: 0; border-top: 1px solid var(--divider-color);">
+    <label style="margin-top:0;">System Log</label>
+    <div id="terminal">Loading logs...</div>
+    <button class="clear-btn" onclick="fetch('/clearlogs')">Clear Logs</button>
+  </div>
+</div>
+</body></html>
+)rawliteral";
+
+// ==========================================
+// SERVER HANDLERS
+// ==========================================
+
+void handleRoot() {
+  String html = html_template;
+  html.replace("id=\"ssid\">", "id=\"ssid\" value=\"" + wifi_ssid + "\">");
+  html.replace("id=\"pass\">", "id=\"pass\" value=\"" + wifi_pass + "\">"); 
+  html.replace("id=\"asrkey\">", "id=\"asrkey\" value=\"" + asr_key + "\">");
+  html.replace("id=\"asrclus\">", "id=\"asrclus\" value=\"" + asr_clust + "\">");
+  html.replace("id=\"apikey\">", "id=\"apikey\" value=\"" + openai_key + "\">");
+  html.replace("id=\"apiurl\">", "id=\"apiurl\" value=\"" + openai_url + "\">");
+  html.replace("id=\"prompt\"></textarea>", "id=\"prompt\">" + sys_prompt + "</textarea>");
+  // Inject Intro
+  html.replace("id=\"intro\"></textarea>", "id=\"intro\">" + ai_intro + "</textarea>");
+  
+  html.replace("id=\"mqserver\">", "id=\"mqserver\" value=\"" + mqtt_server + "\">");
+  html.replace("id=\"mqport\">", "id=\"mqport\" value=\"" + mqtt_port + "\">");
+  html.replace("id=\"mquser\">", "id=\"mquser\" value=\"" + mqtt_user + "\">");
+  html.replace("id=\"mqpass\">", "id=\"mqpass\" value=\"" + mqtt_pass + "\">");
+  html.replace("id=\"mqpub_guest\">", "id=\"mqpub_guest\" value=\"" + mqtt_topic_guest + "\">");
+  html.replace("id=\"mqpub_ai\">", "id=\"mqpub_ai\" value=\"" + mqtt_topic_ai + "\">");
+  html.replace("id=\"mqsub\">", "id=\"mqsub\" value=\"" + mqtt_topic_sub + "\">");
+
+  server.send(200, "text/html", html);
+}
+
+void handleSave() {
+  if (server.hasArg("ssid")) {
+    preferences.putString("ssid", server.arg("ssid"));
+    preferences.putString("pass", server.arg("pass"));
+    preferences.putString("asrkey", server.arg("asrkey"));
+    preferences.putString("asrclus", server.arg("asrclus"));
+    preferences.putString("apikey", server.arg("apikey"));
+    preferences.putString("apiurl", server.arg("apiurl"));
+    preferences.putString("prompt", server.arg("prompt"));
+    // Save Intro
+    preferences.putString("intro", server.arg("intro"));
+    
+    preferences.putString("mqserver", server.arg("mqserver"));
+    preferences.putString("mqport", server.arg("mqport"));
+    preferences.putString("mquser", server.arg("mquser"));
+    preferences.putString("mqpass", server.arg("mqpass"));
+    preferences.putString("mqpub_g", server.arg("mqpub_guest"));
+    preferences.putString("mqpub_a", server.arg("mqpub_ai"));
+    preferences.putString("mqsub", server.arg("mqsub"));
+    
+    server.send(200, "text/html", "<body style='background:#121212;color:white;text-align:center;padding:50px;font-family:sans-serif;'><h1>Saved!</h1><p>Restarting...</p><a href='/'>Go Back</a></body>");
+    delay(1000);
+    ESP.restart();
+  } else {
+    server.send(400, "text/plain", "Bad Request");
+  }
+}
+
+void handleLogs() { server.send(200, "text/plain", webLogBuffer); }
+void handleClearLogs() { webLogBuffer = ""; sysLogLn("--- Logs Cleared ---"); server.send(200, "text/plain", "Cleared"); }
+
+void handleConversation() {
+  String json = "{";
+  json += "\"user\":\"" + jsonEscape(lastUserText) + "\",";
+  json += "\"ai\":\"" + jsonEscape(lastAIText) + "\"";
+  json += "}";
+  server.send(200, "application/json", json);
+}
+
+void handleToggle() {
+  if (continuousMode) {
+    stopContinuousMode();
+    server.send(200, "text/plain", "Stopped");
+  } else {
+    if (currentState == STATE_IDLE) {
+      startContinuousMode(true); 
+      server.send(200, "text/plain", "Started");
+    } else {
+      server.send(200, "text/plain", "Busy");
+    }
+  }
+}
+
+// ==========================================
+// SETUP & LOGIC
+// ==========================================
+
+void setup() {
+  Serial.begin(115200);
+  delay(2000); 
+  pinMode(BOOT_BUTTON_PIN, INPUT_PULLUP);
+  setLedColor(0, 0, 0); 
+  sysLogLn("\n\n--- Booting Escher Doorbell ---");
+
+  // Load Settings
+  preferences.begin("doorbell", false);
+  
+  wifi_ssid = preferences.getString("ssid", "DefaultSSID");
+  wifi_pass = preferences.getString("pass", "DefaultPass");
+  asr_key   = preferences.getString("asrkey", "asr key to get from https://www.aisteb.com/");
+  asr_clust = preferences.getString("asrclus", "volcengine_input_id"); //_id for Bahasa Indonesia
+  openai_key= preferences.getString("apikey", "api key to get from https://www.aisteb.com/");
+  openai_url= preferences.getString("apiurl", "baseurl to get from https://www.aisteb.com/");
+  sys_prompt= preferences.getString("prompt", default_prompt);
+  ai_intro  = preferences.getString("intro", default_intro); // Load Intro
+  
+  mqtt_server = preferences.getString("mqserver", "");
+  mqtt_port   = preferences.getString("mqport", "1883");
+  mqtt_user   = preferences.getString("mquser", "");
+  mqtt_pass   = preferences.getString("mqpass", "");
+  mqtt_topic_guest = preferences.getString("mqpub_g", "escher/doorbell/guest");
+  mqtt_topic_ai    = preferences.getString("mqpub_a", "escher/doorbell/ai");
+  mqtt_topic_sub   = preferences.getString("mqsub", "escher/doorbell/in");
+
+  // WiFi
+  WiFi.mode(WIFI_STA);
+  WiFi.begin(wifi_ssid.c_str(), wifi_pass.c_str());
+  sysLog("Connecting to: " + wifi_ssid);
+  
+  int attempt = 0;
+  while (WiFi.status() != WL_CONNECTED && attempt < 15) {
+    delay(1000); sysLog("."); attempt++;
+  }
+  
+  if (WiFi.status() == WL_CONNECTED) {
+    sysLogLn("\nWiFi Connected! IP: " + WiFi.localIP().toString());
+    isAPMode = false;
+  } else {
+    sysLogLn("\nWiFi Connection Failed.");
+    sysLogLn("Starting Access Point Mode...");
+    isAPMode = true;
+    setLedColor(20, 0, 0); 
+  }
+
+  // AP Mode
+  if (isAPMode) {
+    WiFi.disconnect();
+    WiFi.mode(WIFI_AP);
+    WiFi.softAP("Escher-Doorbell-Setup", "12345678");
+    sysLogLn("AP Started. Connect to WiFi: 'Escher-Doorbell-Setup'");
+    sysLogLn("Then go to: http://" + WiFi.softAPIP().toString());
+  }
+
+  // Web Server
+  server.on("/", handleRoot);
+  server.on("/save", HTTP_POST, handleSave);
+  server.on("/logs", HTTP_GET, handleLogs);
+  server.on("/clearlogs", HTTP_GET, handleClearLogs);
+  server.on("/conversation", HTTP_GET, handleConversation);
+  server.on("/toggle", HTTP_GET, handleToggle);
+  server.begin();
+  sysLogLn("Web Server running.");
+
+  // Initialize AI
+  if (!isAPMode) {
+    setupMQTT();
+
+    asrChat = new ArduinoASRChat(asr_key.c_str(), asr_clust.c_str());
+    gptChat = new ArduinoGPTChat(openai_key.c_str(), openai_url.c_str());
+
+    audio.setPinout(I2S_BCLK, I2S_LRC, I2S_DOUT);
+    audio.setVolume(100);
+
+    gptChat->setSystemPrompt(sys_prompt.c_str());
+    #if ENABLE_CONVERSATION_MEMORY
+      gptChat->enableMemory(true);
+    #else
+      gptChat->enableMemory(false);
+    #endif
+
+    if (!asrChat->initINMP441Microphone(I2S_MIC_SERIAL_CLOCK, I2S_MIC_LEFT_RIGHT_CLOCK, I2S_MIC_SERIAL_DATA)) {
+      sysLogLn("ERROR: Mic Init Failed!");
+      setLedColor(20, 0, 0); 
+    } else {
+      sysLogLn("Mic Initialized: OK"); 
+    }
+
+    asrChat->setAudioParams(SAMPLE_RATE, 16, 1);
+    asrChat->setSilenceDuration(1000);
+    asrChat->setMaxRecordingSeconds(50);
+    
+    asrChat->setTimeoutNoSpeechCallback([]() {
+      if (continuousMode) stopContinuousMode();
+    });
+
+    if (!asrChat->connectWebSocket()) {
+      sysLogLn("ERROR: ASR WebSocket Failed! (Will retry on talk)");
+      setLedColor(20, 0, 0); 
+    } else {
+      sysLogLn("ASR Ready.");
+    }
+    
+    sysLogLn("AI Ready. Press BOOT button to talk.");
+  }
+}
+
+// Logic
+void startContinuousMode(bool playIntro) {
+  if (isAPMode) return;
+  continuousMode = true;
+  
+  publishToTopic("escher/doorbell/button", "pressed");
+  sysLogLn("[MQTT] Doorbell Event: Pressed");
+
+  if (playIntro) {
+    sysLogLn("\n--- INTRO ---");
+    currentState = STATE_PLAYING_TTS;
+    setLedColor(0, 50, 0); // GREEN
+    
+    // Play the stored intro variable
+    if (gptChat->textToSpeech(ai_intro.c_str())) {
+      currentState = STATE_WAIT_TTS_COMPLETE;
+      ttsStartTime = millis();
+      ttsCheckTime = millis();
+      return; 
+    }
+  }
+
+  currentState = STATE_LISTENING;
+  sysLogLn("\n--- START ---");
+  sysLogLn("Listening...");
+  publishToTopic(mqtt_topic_guest, "Started Listening");
+  setLedColor(0, 0, 50); // BLUE
+  
+  if (asrChat && asrChat->startRecording()) {
+    // Success
+  } else {
+    sysLogLn("WebSocket dropped. Reconnecting...");
+    setLedColor(50, 50, 0); 
+    
+    if (asrChat->connectWebSocket()) {
+       sysLogLn("Reconnected. Retrying...");
+       delay(200);
+       if (asrChat->startRecording()) {
+         setLedColor(0, 0, 50); 
+         return; 
+       }
+    }
+    
+    sysLogLn("Failed. Check Mic (L/R->GND) and WiFi.");
+    setLedColor(50, 0, 0); 
+    continuousMode = false;
+    currentState = STATE_IDLE;
+  }
+}
+
+void stopContinuousMode() {
+  continuousMode = false;
+  sysLogLn("\n--- STOP ---");
+  publishToTopic("escher/doorbell/status", "Stopped Listening");
+  if (asrChat && asrChat->isRecording()) asrChat->stopRecording();
+  currentState = STATE_IDLE;
+  setLedColor(0, 0, 0); 
+}
+
+void handleASRResult() {
+  if (!asrChat || !gptChat) return;
+
+  String transcribedText = asrChat->getRecognizedText();
+  asrChat->clearResult();
+
+  if (transcribedText.length() > 0) {
+    sysLogLn("\n[User]: " + transcribedText);
+    lastUserText = transcribedText;
+    publishToTopic(mqtt_topic_guest, transcribedText);
+
+    currentState = STATE_PROCESSING_LLM;
+    sysLog("[AI]: Thinking...");
+    setLedColor(0, 50, 0); // GREEN
+    
+    String response = gptChat->sendMessage(transcribedText);
+    
+    if (response.length() > 0) {
+      sysLogLn(" " + response);
+      lastAIText = response;
+      publishToTopic(mqtt_topic_ai, response);
+
+      currentState = STATE_PLAYING_TTS;
+      sysLog("[TTS]: Speaking...");
+      
+      if (gptChat->textToSpeech(response)) {
+        currentState = STATE_WAIT_TTS_COMPLETE;
+        ttsStartTime = millis();
+        ttsCheckTime = millis();
+      } else {
+        sysLogLn("Error: TTS Failed");
+        setLedColor(50, 0, 0); 
+        if (continuousMode) { delay(500); startContinuousMode(false); } 
+        else { currentState = STATE_IDLE; setLedColor(0,0,0); }
+      }
+    } else {
+      sysLogLn("Error: LLM Failed");
+      setLedColor(50, 0, 0); 
+      if (continuousMode) { delay(500); startContinuousMode(false); }
+      else { currentState = STATE_IDLE; setLedColor(0,0,0); }
+    }
+  } else {
+    if (continuousMode) { delay(500); startContinuousMode(false); }
+    else { currentState = STATE_IDLE; setLedColor(0,0,0); }
+  }
+}
+
+void loop() {
+  server.handleClient();
+  if (isAPMode) return;
+
+  audio.loop();
+  
+  if (mqtt_server.length() > 0) {
+    if (!mqttClient.connected()) {
+      unsigned long now = millis();
+      if (now - lastMqttReconnectAttempt > 5000) {
+        lastMqttReconnectAttempt = now;
+        if (reconnectMQTT()) {
+          lastMqttReconnectAttempt = 0;
+        }
+      }
+    } else {
+      mqttClient.loop();
+    }
+  }
+
+  if (asrChat) asrChat->loop();
+
+  buttonPressed = (digitalRead(BOOT_BUTTON_PIN) == LOW);
+  if (buttonPressed && !wasButtonPressed) {
+    wasButtonPressed = true;
+    if (!continuousMode && currentState == STATE_IDLE) {
+        startContinuousMode(true); 
+    } else if (continuousMode) {
+        stopContinuousMode();
+    }
+  } else if (!buttonPressed && wasButtonPressed) {
+    wasButtonPressed = false;
+  }
+
+  switch (currentState) {
+    case STATE_IDLE: break;
+    case STATE_LISTENING:
+      if (asrChat->hasNewResult()) handleASRResult();
+      break;
+    case STATE_PROCESSING_LLM: break;
+    case STATE_PLAYING_TTS: break;
+    case STATE_WAIT_TTS_COMPLETE:
+      if (millis() - ttsCheckTime > 100) {
+        ttsCheckTime = millis();
+        if (!audio.isRunning()) {
+          sysLogLn("[TTS]: Done.");
+          if (continuousMode) {
+            delay(500);
+            startContinuousMode(false); 
+          } else {
+            currentState = STATE_IDLE;
+            setLedColor(0, 0, 0); 
+          }
+        }
+      }
+      break;
+  }
+  
+  if (currentState == STATE_LISTENING) yield();
+  else delay(10);
+}
