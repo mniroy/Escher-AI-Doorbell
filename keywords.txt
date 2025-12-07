@@ -1,9 +1,13 @@
 #######################################
-# Syntax Coloring Map For DAZI-AI
+
+Syntax Coloring Map For Escher-AI-Doorbell
+
 #######################################
 
 #######################################
-# Datatypes (KEYWORD1)
+
+Datatypes (KEYWORD1)
+
 #######################################
 
 ArduinoGPTChat	KEYWORD1
@@ -11,10 +15,13 @@ ArduinoASRChat	KEYWORD1
 Audio	KEYWORD1
 
 #######################################
-# Methods and Functions (KEYWORD2)
+
+Methods and Functions (KEYWORD2)
+
 #######################################
 
-# ArduinoGPTChat methods
+ArduinoGPTChat methods
+
 setApiConfig	KEYWORD2
 setSystemPrompt	KEYWORD2
 enableMemory	KEYWORD2
@@ -31,36 +38,41 @@ stopRecordingAndProcess	KEYWORD2
 isRecording	KEYWORD2
 getRecordedSampleCount	KEYWORD2
 
-# ArduinoASRChat methods
+ArduinoASRChat methods
+
 begin	KEYWORD2
-startASR	KEYWORD2
-stopASR	KEYWORD2
+initINMP441Microphone	KEYWORD2
+connectWebSocket	KEYWORD2
+setAudioParams	KEYWORD2
+setTimeoutNoSpeechCallback	KEYWORD2
+startRecording	KEYWORD2
+stopRecording	KEYWORD2
 processASR	KEYWORD2
 isASRActive	KEYWORD2
 getRecognizedText	KEYWORD2
-hasNewText	KEYWORD2
-clearRecognizedText	KEYWORD2
+hasNewResult	KEYWORD2
+clearResult	KEYWORD2
 setSilenceDuration	KEYWORD2
 setMaxRecordingSeconds	KEYWORD2
 isRecordingActive	KEYWORD2
-onSpeechStart	KEYWORD2
-onSpeechEnd	KEYWORD2
-onPartialResult	KEYWORD2
-onFinalResult	KEYWORD2
+loop	KEYWORD2
 
-# Audio methods
+Audio methods
+
 setPinout	KEYWORD2
 setVolume	KEYWORD2
 connecttohost	KEYWORD2
 connecttoFS	KEYWORD2
 connecttoSD	KEYWORD2
 connecttospeech	KEYWORD2
-loop	KEYWORD2
 pauseResume	KEYWORD2
 setTimeOffset	KEYWORD2
 setTone	KEYWORD2
 getAudioCurrentTime	KEYWORD2
+isRunning	KEYWORD2
 
 #######################################
-# Constants (LITERAL1)
+
+Constants (LITERAL1)
+
 #######################################
