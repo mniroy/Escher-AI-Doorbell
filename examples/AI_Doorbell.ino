@@ -248,12 +248,12 @@ void setup() {
   // Load Settings
   preferences.begin("doorbell", false);
   
-  wifi_ssid = preferences.getString("ssid", "EscherHome_IoT");
-  wifi_pass = preferences.getString("pass", "1234567890");
-  asr_key   = preferences.getString("asrkey", "07fcb4a5-b7b2-45d8-864a-8cc0292380df");
+  wifi_ssid = preferences.getString("ssid", "ssid");
+  wifi_pass = preferences.getString("pass", "password");
+  asr_key   = preferences.getString("asrkey", "asr key");
   asr_clust = preferences.getString("asrclus", "volcengine_input_id");
-  openai_key= preferences.getString("apikey", "sk-KkEHJ5tO1iiYIqr1jOmrH6FV2uagIICwzL0PDWarGIoHe3Zm");
-  openai_url= preferences.getString("apiurl", "https://api.chatanywhere.tech");
+  openai_key= preferences.getString("apikey", "sk-token");
+  openai_url= preferences.getString("apiurl", "open ai api url");
   sys_prompt= preferences.getString("prompt", DEFAULT_PROMPT);
   
   asr_max_duration = preferences.getInt("timeout", 50);
