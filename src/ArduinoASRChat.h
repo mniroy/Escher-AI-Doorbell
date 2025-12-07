@@ -14,24 +14,13 @@ enum MicrophoneType {
   MIC_TYPE_INMP441   // INMP441 I2S MEMS microphone
 };
 
-// Message types for ByteDance ASR protocol
-#define CLIENT_FULL_REQUEST 0b0001
-#define CLIENT_AUDIO_ONLY_REQUEST 0b0010
-#define SERVER_FULL_RESPONSE 0b1001
-#define SERVER_ACK 0b1011
-#define SERVER_ERROR_RESPONSE 0b1111
-
-// Sequence flags
-#define NO_SEQUENCE 0b0000
-#define NEG_SEQUENCE 0b0010
-
 class ArduinoASRChat {
   public:
     // Constructor
-    ArduinoASRChat(const char* apiKey, const char* cluster = "volcengine_input_en");
+    ArduinoASRChat(const char* apiKey, const char* modelId = "scribe_v2");
 
     // Configuration methods
-    void setApiConfig(const char* apiKey, const char* cluster = nullptr);
+    void setApiConfig(const char* apiKey, const char* modelId = nullptr);
     void setMicrophoneType(MicrophoneType micType);
     void setAudioParams(int sampleRate = 16000, int bitsPerSample = 16, int channels = 1);
     void setSilenceDuration(unsigned long duration);
@@ -70,10 +59,12 @@ class ArduinoASRChat {
   private:
     // WebSocket configuration
     const char* _apiKey;
-    const char* _cluster;
-    const char* _wsHost = "openspeech.bytedance.com";
+    const char* _modelId;
+    
+    // ElevenLabs API Configuration
+    const char* _wsHost = "api.elevenlabs.io";
     const int _wsPort = 443;
-    const char* _wsPath = "/api/v2/asr";
+    const char* _wsPath = "/v1/speech-to-text/stream-input";
 
     // Audio parameters
     int _sampleRate = 16000;
@@ -97,8 +88,7 @@ class ArduinoASRChat {
     bool _shouldStop = false;
     bool _hasSpeech = false;
     bool _hasNewResult = false;
-    bool _endMarkerSent = false;  // Track if end marker has been sent
-
+    
     // Recording state
     String _lastResultText = "";
     String _recognizedText = "";
@@ -119,11 +109,14 @@ class ArduinoASRChat {
     String generateWebSocketKey();
     void handleWebSocketData();
     void sendWebSocketFrame(uint8_t* data, size_t len, uint8_t opcode);
-    void sendFullRequest();
+    
+    // Protocol Methods (ElevenLabs JSON)
+    void sendStartConfig();
     void sendAudioChunk(uint8_t* data, size_t len);
     void sendEndMarker();
     void sendPong();
     void parseResponse(uint8_t* data, size_t len);
+    
     void processAudioSending();
     void checkRecordingTimeout();
     void checkSilence();
